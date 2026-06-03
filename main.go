@@ -33,10 +33,7 @@ func main() {
 	go func() {
 		for {
 			time.Sleep(10 * time.Minute)
-			url := "https://" + os.Getenv("RENDER_EXTERNAL_URL") + "/ping"
-			if url == "https:///ping" {
-				url = "https://sere-wb5r.onrender.com/ping"
-			}
+			url := "https://sere-wb5r.onrender.com/ping"
 			resp, err := http.Get(url)
 			if err == nil {
 				resp.Body.Close()
