@@ -1,9 +1,11 @@
-// signaling/main.go - ЭТО ЗАЛИВАЕТСЯ НА RENDER.COM
+// signaling/main.go - ИСПРАВЛЕННЫЙ ДЛЯ RENDER
 package main
 
 import (
 	"log"
 	"net/http"
+	"os"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -19,15 +21,26 @@ var (
 )
 
 func main() {
+	// Render передает порт через переменную окружения PORT
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
 	http.HandleFunc("/signal", handler)
 
-		go func() {
+	// Пинг самого себя
+	go func() {
 		for {
 			time.Sleep(10 * time.Minute)
-			resp, err := http.Get("https://sere-wb5r.onrender.com/ping")
+			url := "https://" + os.Getenv("RENDER_EXTERNAL_URL") + "/ping"
+			if url == "https:///ping" {
+				url = "https://sere-wb5r.onrender.com/ping"
+			}
+			resp, err := http.Get(url)
 			if err == nil {
 				resp.Body.Close()
-				log.Println("✅ Пинг выполнен, сервер активен")
+				log.Println("✅ Пинг выполнен")
 			} else {
 				log.Println("❌ Ошибка пинга:", err)
 			}
@@ -38,9 +51,9 @@ func main() {
 	http.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("pong"))
 	})
-	
-	log.Println("✅ Signaling сервер запущен на порту 8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+
+	log.Printf("✅ Signaling сервер запущен на порту %s", port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
 func handler(w http.ResponseWriter, r *http.Request) {
@@ -57,7 +70,6 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		serverConn = conn
 		log.Println("✅ Сервер (друг) подключен к signaling")
 
-		// Пересылаем все сообщения от друга тебе
 		for {
 			_, msg, err := conn.ReadMessage()
 			if err != nil {
@@ -73,7 +85,6 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		clientConn = conn
 		log.Println("✅ Клиент (ты) подключен к signaling")
 
-		// Пересылаем все сообщения от тебя другу
 		for {
 			_, msg, err := conn.ReadMessage()
 			if err != nil {
