@@ -20,6 +20,24 @@ var (
 
 func main() {
 	http.HandleFunc("/signal", handler)
+
+		go func() {
+		for {
+			time.Sleep(10 * time.Minute)
+			resp, err := http.Get("https://sere-wb5r.onrender.com/ping")
+			if err == nil {
+				resp.Body.Close()
+				log.Println("✅ Пинг выполнен, сервер активен")
+			} else {
+				log.Println("❌ Ошибка пинга:", err)
+			}
+		}
+	}()
+
+	// Эндпоинт для пинга
+	http.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("pong"))
+	})
 	
 	log.Println("✅ Signaling сервер запущен на порту 8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
