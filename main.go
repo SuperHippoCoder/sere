@@ -1,115 +1,67 @@
-// render.go - залить на Render как Web Service
 package main
 
 import (
-    "encoding/gob"
-    "log"
-    "net/http"
-    "os"
-    "sync"
-    "time"
+	"log"
+	"net/http"
+	"sync"
+	"time"
 
-    "github.com/gorilla/websocket"
+	"github.com/gorilla/websocket"
 )
 
-var upgrader = websocket.Upgrader{
-    CheckOrigin: func(r *http.Request) bool { return true },
-}
+var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+var clients = make(map[*websocket.Conn]bool)
+var mu sync.Mutex
 
-type Payload struct {
-    Data []byte
-    X, Y int
-}
+func handleConnections(w http.ResponseWriter, r *http.Request) {
+	ws, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Println("WebSocket upgrade error:", err)
+		return
+	}
+	defer ws.Close()
 
-type Command struct {
-    Type   string
-    X, Y   int
-    Button string
-    Key    string
-    Shift  bool
-}
+	mu.Lock()
+	clients[ws] = true
+	mu.Unlock()
 
-var (
-    clients   = make(map[*websocket.Conn]bool)
-    clientsMu sync.RWMutex
-)
+	for {
+		_, msg, err := ws.ReadMessage()
+		if err != nil {
+			mu.Lock()
+			delete(clients, ws)
+			mu.Unlock()
+			break
+		}
+		mu.Lock()
+		for client := range clients {
+			if client != ws {
+				client.WriteMessage(websocket.BinaryMessage, msg)
+			}
+		}
+		mu.Unlock()
+	}
+}
 
 func main() {
-    port := os.Getenv("PORT")
-    if port == "" {
-        port = "8080"
-    }
+	// Эндпоинт для пинга
+	http.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("pong"))
+	})
 
-    // Простой WebSocket релей
-    http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-        conn, err := upgrader.Upgrade(w, r, nil)
-        if err != nil {
-            log.Println("WebSocket upgrade error:", err)
-            return
-        }
-        defer conn.Close()
+	// Пинг самого себя каждые 10 минут
+	go func() {
+		for {
+			time.Sleep(10 * time.Minute)
+			resp, err := http.Get("https://sere-wb5r.onrender.com/ping")
+			if err == nil {
+				resp.Body.Close()
+				log.Println("✅ Пинг выполнен")
+			}
+		}
+	}()
 
-        // Регистрируем клиента
-        clientsMu.Lock()
-        clients[conn] = true
-        clientsMu.Unlock()
-
-        log.Printf("✅ Клиент подключился. Всего: %d", len(clients))
-
-        // Отправляем подтверждение
-        conn.WriteMessage(websocket.TextMessage, []byte("connected"))
-
-        // Читаем и пересылаем всем
-        for {
-            _, msg, err := conn.ReadMessage()
-            if err != nil {
-                clientsMu.Lock()
-                delete(clients, conn)
-                clientsMu.Unlock()
-                log.Printf("❌ Клиент отключился. Всего: %d", len(clients))
-                break
-            }
-
-            // Пересылаем всем остальным клиентам
-            clientsMu.RLock()
-            for client := range clients {
-                if client != conn {
-                    err := client.WriteMessage(websocket.BinaryMessage, msg)
-                    if err != nil {
-                        client.Close()
-                        delete(clients, client)
-                    }
-                }
-            }
-            clientsMu.RUnlock()
-        }
-    })
-
-    // Пинг для предотвращения сна Render
-    http.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
-        w.Write([]byte("pong"))
-    })
-
-    // health check
-    http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-        clientsMu.RLock()
-        count := len(clients)
-        clientsMu.RUnlock()
-        w.Write([]byte(`{"status":"ok","clients":` + string(rune(count)) + `}`))
-    })
-
-    // Авто-пинг каждые 10 минут
-    go func() {
-        for {
-            time.Sleep(10 * time.Minute)
-            url := "https://" + os.Getenv("RENDER_EXTERNAL_URL") + "/ping"
-            if os.Getenv("RENDER_EXTERNAL_URL") != "" {
-                http.Get(url)
-                log.Println("✅ Self-ping выполнен")
-            }
-        }
-    }()
-
-    log.Printf("✅ Сервер запущен на порту %s", port)
-    log.Fatal(http.ListenAndServe(":"+port, nil))
+	http.HandleFunc("/ws", handleConnections)
+	log.Println("✅ Сервер запущен")
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
