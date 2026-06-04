@@ -1,140 +1,115 @@
-// signaling/main.go - ЗАЛИВАЕМ НА RENDER
+// render.go - залить на Render как Web Service
 package main
 
 import (
-	"encoding/json"
-	"log"
-	"net/http"
-	"os"
-	"sync"
-	"time"
+    "encoding/gob"
+    "log"
+    "net/http"
+    "os"
+    "sync"
+    "time"
 
-	"github.com/gorilla/websocket"
+    "github.com/gorilla/websocket"
 )
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
+    CheckOrigin: func(r *http.Request) bool { return true },
 }
 
-type SignalingMessage struct {
-	Type      string          `json:"type"`      // "offer", "answer", "candidate"
-	From      string          `json:"from"`      // "server" или "client"
-	To        string          `json:"to"`        // "server" или "client"
-	Data      json.RawMessage `json:"data"`      // SDP или ICE данные
+type Payload struct {
+    Data []byte
+    X, Y int
+}
+
+type Command struct {
+    Type   string
+    X, Y   int
+    Button string
+    Key    string
+    Shift  bool
 }
 
 var (
-	clients   = make(map[string]*websocket.Conn)
-	clientsMu sync.RWMutex
+    clients   = make(map[*websocket.Conn]bool)
+    clientsMu sync.RWMutex
 )
 
 func main() {
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
+    port := os.Getenv("PORT")
+    if port == "" {
+        port = "8080"
+    }
 
-	http.HandleFunc("/signal", signalHandler)
-	http.HandleFunc("/ping", pingHandler)
-	http.HandleFunc("/health", healthHandler)
+    // Простой WebSocket релей
+    http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+        conn, err := upgrader.Upgrade(w, r, nil)
+        if err != nil {
+            log.Println("WebSocket upgrade error:", err)
+            return
+        }
+        defer conn.Close()
 
-	// Пинг самого себя
-	go selfPing()
+        // Регистрируем клиента
+        clientsMu.Lock()
+        clients[conn] = true
+        clientsMu.Unlock()
 
-	log.Printf("✅ Signaling сервер запущен на порту %s", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
-}
+        log.Printf("✅ Клиент подключился. Всего: %d", len(clients))
 
-func signalHandler(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Println("WebSocket upgrade error:", err)
-		return
-	}
-	defer conn.Close()
+        // Отправляем подтверждение
+        conn.WriteMessage(websocket.TextMessage, []byte("connected"))
 
-	role := r.URL.Query().Get("role")
-	if role != "server" && role != "client" {
-		log.Println("Неизвестная роль:", role)
-		return
-	}
+        // Читаем и пересылаем всем
+        for {
+            _, msg, err := conn.ReadMessage()
+            if err != nil {
+                clientsMu.Lock()
+                delete(clients, conn)
+                clientsMu.Unlock()
+                log.Printf("❌ Клиент отключился. Всего: %d", len(clients))
+                break
+            }
 
-	// Регистрируем клиента
-	clientsMu.Lock()
-	clients[role] = conn
-	clientsMu.Unlock()
+            // Пересылаем всем остальным клиентам
+            clientsMu.RLock()
+            for client := range clients {
+                if client != conn {
+                    err := client.WriteMessage(websocket.BinaryMessage, msg)
+                    if err != nil {
+                        client.Close()
+                        delete(clients, client)
+                    }
+                }
+            }
+            clientsMu.RUnlock()
+        }
+    })
 
-	log.Printf("✅ %s подключился к signaling", role)
+    // Пинг для предотвращения сна Render
+    http.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+        w.Write([]byte("pong"))
+    })
 
-	// Отправляем подтверждение
-	conn.WriteJSON(map[string]string{"status": "connected", "role": role})
+    // health check
+    http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+        clientsMu.RLock()
+        count := len(clients)
+        clientsMu.RUnlock()
+        w.Write([]byte(`{"status":"ok","clients":` + string(rune(count)) + `}`))
+    })
 
-	// Обработка сообщений
-	for {
-		var msg SignalingMessage
-		err := conn.ReadJSON(&msg)
-		if err != nil {
-			log.Printf("%s отключился", role)
-			clientsMu.Lock()
-			delete(clients, role)
-			clientsMu.Unlock()
-			break
-		}
+    // Авто-пинг каждые 10 минут
+    go func() {
+        for {
+            time.Sleep(10 * time.Minute)
+            url := "https://" + os.Getenv("RENDER_EXTERNAL_URL") + "/ping"
+            if os.Getenv("RENDER_EXTERNAL_URL") != "" {
+                http.Get(url)
+                log.Println("✅ Self-ping выполнен")
+            }
+        }
+    }()
 
-		// Пересылаем сообщение другому клиенту
-		targetRole := "server"
-		if role == "server" {
-			targetRole = "client"
-		}
-
-		clientsMu.RLock()
-		targetConn, exists := clients[targetRole]
-		clientsMu.RUnlock()
-
-		if exists {
-			msg.From = role
-			msg.To = targetRole
-			err = targetConn.WriteJSON(msg)
-			if err != nil {
-				log.Printf("Ошибка отправки сообщения %s: %v", targetRole, err)
-			} else {
-				log.Printf("📡 Переслано %s -> %s: %s", role, targetRole, msg.Type)
-			}
-		}
-	}
-}
-
-func pingHandler(w http.ResponseWriter, r *http.Request) {
-	w.Write([]byte("pong"))
-}
-
-func healthHandler(w http.ResponseWriter, r *http.Request) {
-	clientsMu.RLock()
-	serverConnected := clients["server"] != nil
-	clientConnected := clients["client"] != nil
-	clientsMu.RUnlock()
-
-	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(`{"status":"ok","server":"` + 
-		map[bool]string{true: "connected", false: "disconnected"}[serverConnected] + 
-		`","client":"` + 
-		map[bool]string{true: "connected", false: "disconnected"}[clientConnected] + 
-		`"}`))
-}
-
-func selfPing() {
-	for {
-		time.Sleep(10 * time.Minute)
-		url := "https://" + os.Getenv("RENDER_EXTERNAL_URL") + "/ping"
-		if os.Getenv("RENDER_EXTERNAL_URL") == "" {
-			continue
-		}
-		resp, err := http.Get(url)
-		if err == nil {
-			resp.Body.Close()
-			log.Println("✅ Self-ping выполнен")
-		}
-	}
+    log.Printf("✅ Сервер запущен на порту %s", port)
+    log.Fatal(http.ListenAndServe(":"+port, nil))
 }
